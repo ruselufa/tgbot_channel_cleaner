@@ -1,5 +1,5 @@
 import logging
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
@@ -19,15 +19,26 @@ def init_db():
         engine = create_engine(DATABASE_URL)
         
         # Создаем все таблицы
-        Base.metadata.create_all(engine)
+        Base.metadata.drop_all(engine)  # Удаляем старые таблицы
+        Base.metadata.create_all(engine)  # Создаем новые таблицы с обновленной схемой
         
         # Создаем фабрику сессий
         Session = sessionmaker(bind=engine)
+        session = Session()
+        
+        # Изменяем тип колонки telegram_id на BIGINT
+        try:
+            session.execute(text("ALTER TABLE users ALTER COLUMN telegram_id TYPE BIGINT"))
+            session.commit()
+            logger.info("Column telegram_id type changed to BIGINT")
+        except Exception as e:
+            logger.warning(f"Error changing column type (might be already BIGINT): {e}")
+            session.rollback()
         
         logger.info("Database initialized successfully")
         return Session
         
-    except SQLAlchemyError as e:
+    except Exception as e:
         logger.error(f"Error initializing database: {e}")
         raise
 
