@@ -14,9 +14,9 @@ import traceback
 
 class TextAnalyzer:
     MODELS = {
-        'sentiment': 'cointegrated/rubert-tiny2-sentiment',
-        'toxic': 'cointegrated/rubert-tiny2-toxic',
-        'emotion': 'cointegrated/rubert-tiny2-emotion'
+        'sentiment': 'blanchefort/rubert-base-cased-sentiment',
+        'toxic': 'SkolkovoInstitute/russian_toxicity_classifier',
+        'emotion': 'Aniemore/rubert-tiny2-russian-emotion-detection'
     }
 
     def __init__(self):
@@ -30,11 +30,7 @@ class TextAnalyzer:
             
             try:
                 print("\n1/3 Загрузка модели анализа тональности...")
-                self.sentiment_analyzer = pipeline(
-                    "sentiment-analysis",
-                    model="blanchefort/rubert-base-cased-sentiment",
-                    device=device
-                )
+                self.sentiment_analyzer = pipeline("sentiment-analysis", model=self.MODELS['sentiment'])
                 print("✓ Модель тональности загружена")
             except Exception as e:
                 print(f"✗ Ошибка загрузки модели тональности: {str(e)}")
@@ -43,11 +39,7 @@ class TextAnalyzer:
             
             try:
                 print("\n2/3 Загрузка модели определения токсичности...")
-                self.toxic_analyzer = pipeline(
-                    "text-classification",
-                    model="SkolkovoInstitute/russian_toxicity_classifier",
-                    device=device
-                )
+                self.toxicity_analyzer = pipeline("text-classification", model=self.MODELS['toxic'])
                 print("✓ Модель токсичности загружена")
             except Exception as e:
                 print(f"✗ Ошибка загрузки модели токсичности: {str(e)}")
@@ -56,11 +48,7 @@ class TextAnalyzer:
             
             try:
                 print("\n3/3 Загрузка модели определения эмоций...")
-                self.emotion_analyzer = pipeline(
-                    "text-classification",
-                    model="Aniemore/rubert-tiny2-russian-emotion-detection",
-                    device=device
-                )
+                self.emotion_analyzer = pipeline("text-classification", model=self.MODELS['emotion'])
                 print("✓ Модель эмоций загружена")
             except Exception as e:
                 print(f"✗ Ошибка загрузки модели эмоций: {str(e)}")
@@ -78,7 +66,7 @@ class TextAnalyzer:
             print(f"Причина: {str(e)}")
             traceback.print_exc()
             self.sentiment_analyzer = MockSentimentAnalyzer()
-            self.toxic_analyzer = MockToxicAnalyzer()
+            self.toxicity_analyzer = MockToxicAnalyzer()
             self.emotion_analyzer = MockEmotionAnalyzer()
             self.using_mock = True
 
@@ -87,14 +75,12 @@ class TextAnalyzer:
         try:
             if not text:
                 return False
-                
+            
             # Анализ тональности
             sentiment = self.sentiment_analyzer(text)[0]
-            sentiment_score = sentiment['score'] if sentiment['label'] == 'POSITIVE' else -sentiment['score']
             
             # Анализ токсичности
-            toxic = self.toxic_analyzer(text)[0]
-            toxic_score = toxic['score'] if toxic['label'] == 'toxic' else 0
+            toxic = self.toxicity_analyzer(text)[0]
             
             # Анализ эмоций
             emotion = self.emotion_analyzer(text)[0]
@@ -102,11 +88,15 @@ class TextAnalyzer:
             # Логируем результаты анализа
             logging.info(f"Text analysis results: sentiment={sentiment}, toxic={toxic}, emotion={emotion}")
             
-            # Определяем негативность по комбинации факторов
+            # Сообщение считается негативным если:
+            # 1. Оно токсичное (любая токсичная метка со score > 0.8)
+            # 2. ИЛИ имеет негативную тональность (NEGATIVE) И эмоцию anger/sadness/fear/disgust с высоким score (> 0.7)
+            toxic_labels = ['toxic', 'insult', 'threat', 'obscene']
             is_negative = (
-                sentiment_score < NEGATIVE_THRESHOLD or
-                toxic_score > 0.7 or
-                emotion['label'] in ['anger', 'sadness', 'fear', 'disgust']
+                (toxic['label'] in toxic_labels and toxic['score'] > 0.8) or
+                (sentiment['label'] == 'NEGATIVE' and 
+                 emotion['label'] in ['anger', 'sadness', 'fear', 'disgust'] and
+                 emotion['score'] > 0.7)
             )
             
             return is_negative
@@ -116,21 +106,25 @@ class TextAnalyzer:
             return False
 
     async def get_toxicity_score(self, text: str) -> float:
-        """Получение оценки токсичности текста"""
+        """Возвращает оценку токсичности текста"""
         try:
-            toxic = self.toxic_analyzer(text)[0]
-            return toxic['score'] if toxic['label'] == 'toxic' else 0
+            result = self.toxicity_analyzer(text)[0]
+            logging.info(f"Toxicity analysis result: {result}")
+            # Возвращаем score для любых токсичных меток
+            toxic_labels = ['toxic', 'insult', 'threat', 'obscene']
+            return result['score'] if result['label'] in toxic_labels else 0.0
         except Exception as e:
-            logging.error(f"Error getting toxicity score: {e}")
+            logging.error(f"Error in toxicity analysis: {e}")
             return 0.0
 
     async def get_emotion(self, text: str) -> str:
-        """Получение эмоциональной окраски текста"""
+        """Определяет эмоциональную окраску текста"""
         try:
-            emotion = self.emotion_analyzer(text)[0]
-            return emotion['label']
+            result = self.emotion_analyzer(text)[0]
+            logging.info(f"Emotion analysis result: {result}")
+            return result['label']
         except Exception as e:
-            logging.error(f"Error getting emotion: {e}")
+            logging.error(f"Error in emotion analysis: {e}")
             return 'neutral'
 
     def get_toxicity_reason(self, analysis: Dict[str, Any]) -> str:

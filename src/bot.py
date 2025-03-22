@@ -89,6 +89,7 @@ class HighLoadBot:
             print(f"Update type: {type(update).__name__}")
             print(f"Has message: {update.message is not None}")
             print(f"Has channel_post: {update.channel_post is not None}")
+            print(f"Has edited_message: {update.edited_message is not None}")
             print(f"Has edited_channel_post: {update.edited_channel_post is not None}")
             print(f"Raw update: {update.to_dict()}")
             print("===============================")
@@ -100,6 +101,12 @@ class HighLoadBot:
             elif update.message:
                 message = update.message
                 update_type = "message"
+            elif update.edited_message:
+                # Передаем измененное сообщение в специальный обработчик
+                return await self.handle_edited_message(update, context)
+            elif update.edited_channel_post:
+                # Передаем измененное сообщение канала в специальный обработчик
+                return await self.handle_edited_message(update, context)
             else:
                 print("Получено обновление без сообщения")
                 return
@@ -180,8 +187,8 @@ class HighLoadBot:
                 username=message.from_user.username
             )
             
-            # Если контент негативный
-            if is_negative:
+            # Если контент негативный и токсичный
+            if is_negative and toxicity_score > 0.7:
                 user = await self.user_service.get_or_create_user(user_id, message.from_user.username)
                 warnings_count = await self.user_service.add_warning(user_id)
                 
@@ -279,79 +286,116 @@ class HighLoadBot:
         try:
             # Получаем измененное сообщение
             message = update.edited_message or update.edited_channel_post
-            if not message or not message.text:
-                print("Получено обновление без текста")
+            if not message:
+                print("Получено обновление без измененного сообщения")
+                return
+            
+            # Получаем текст сообщения (может быть в caption для медиа-сообщений)
+            text = message.text if message.text else message.caption
+            if not text:
+                print("Измененное сообщение без текста")
                 return
             
             print(f"\n=== Изменение сообщения ===")
             print(f"Chat ID: {message.chat.id}")
             print(f"Message ID: {message.message_id}")
-            print(f"Новый текст: {message.text}")
+            print(f"Новый текст: {text}")
             print(f"От пользователя: {message.from_user.username if message.from_user else 'Unknown'}")
             print("===========================")
             
-            # Проверяем, что сообщение из нужного канала
-            if str(message.chat.id) != str(CHANNEL_ID):
-                print(f"Измененное сообщение не из целевого канала")
+            # Проверяем, что сообщение из нужного канала или группы обсуждений
+            chat_id = str(message.chat.id)
+            channel_id = str(CHANNEL_ID)
+            discussion_id = str(DISCUSSION_GROUP_ID)
+            
+            is_from_channel = chat_id == channel_id
+            is_from_discussion = chat_id == discussion_id
+            
+            if not (is_from_channel or is_from_discussion):
+                print(f"Измененное сообщение не из целевого канала или группы обсуждений")
+                print(f"Chat ID: {chat_id}")
+                print(f"CHANNEL_ID: {channel_id}")
+                print(f"DISCUSSION_GROUP_ID: {discussion_id}")
                 return
             
-            # Проверяем изменение
-            edit_result = await self.message_tracker.check_edit(
-                message_id=message.message_id,
-                new_text=message.text
-            )
+            # Для сообщений из группы обсуждений проверяем, что это комментарий к посту из нашего канала
+            if is_from_discussion and hasattr(message, 'reply_to_message'):
+                reply_msg = message.reply_to_message
+                if not (hasattr(reply_msg, 'forward_origin') and 
+                       hasattr(reply_msg.forward_origin, 'chat') and 
+                       str(reply_msg.forward_origin.chat.id) == channel_id):
+                    print("Измененное сообщение не является комментарием к посту из целевого канала")
+                    return
             
-            if not edit_result:
-                print("Не удалось найти историю сообщения")
-                return
-                
-            print(f"\n=== Результат проверки изменения ===")
-            print(f"Подозрительное: {edit_result['is_suspicious']}")
-            print(f"Изменение тональности: {edit_result['edit_info']['sentiment_change']:.2f}")
-            print("===================================")
+            # Анализируем новый текст
+            is_negative = await self.text_analyzer.is_negative(text)
+            toxicity_score = await self.text_analyzer.get_toxicity_score(text)
+            emotion = await self.text_analyzer.get_emotion(text)
             
-            if edit_result['is_suspicious']:
-                # Анализируем новый текст
-                is_negative = await self.text_analyzer.is_negative(message.text)
-                toxicity_score = await self.text_analyzer.get_toxicity_score(message.text)
-                emotion = await self.text_analyzer.get_emotion(message.text)
-                
-                print(f"\n=== Анализ измененного текста ===")
-                print(f"Негативный контент: {is_negative}")
-                print(f"Токсичность: {toxicity_score:.2f}")
-                print(f"Эмоция: {emotion}")
-                print("===============================")
-                
-                if is_negative:
+            print(f"\n=== Анализ измененного текста ===")
+            print(f"Негативный контент: {is_negative}")
+            print(f"Токсичность: {toxicity_score:.2f}")
+            print(f"Эмоция: {emotion}")
+            print("===============================")
+            
+            # Если контент негативный и токсичный
+            if is_negative and toxicity_score > 0.7:
+                try:
+                    # Получаем пользователя
+                    user_id = message.from_user.id if message.from_user else None
+                    if not user_id:
+                        return
+                    
+                    user = await self.user_service.get_or_create_user(user_id, message.from_user.username)
+                    warnings_count = await self.user_service.add_warning(user_id)
+                    
+                    # Удаляем негативное сообщение
                     try:
-                        # Получаем пользователя
-                        user_id = message.from_user.id if message.from_user else None
-                        if not user_id:
-                            return
-                        
-                        user = await self.user_service.get_or_create_user(user_id, message.from_user.username)
-                        warnings_count = await self.user_service.add_warning(user_id)
-                        
-                        # Удаляем негативное сообщение
-                        try:
-                            await context.bot.delete_message(
-                                chat_id=message.chat.id,
-                                message_id=message.message_id
-                            )
-                            print(f"Удалено негативное измененное сообщение (ID: {message.message_id})")
-                        except Exception as e:
-                            print(f"Ошибка при удалении измененного сообщения: {e}")
-                        
-                        # Отправляем предупреждение
+                        await context.bot.delete_message(
+                            chat_id=message.chat.id,
+                            message_id=message.message_id
+                        )
+                        print(f"Удалено негативное измененное сообщение (ID: {message.message_id})")
+                    except Exception as e:
+                        print(f"Ошибка при удалении измененного сообщения: {e}")
+                    
+                    # Отправляем предупреждение в группу обсуждений
+                    warning_text = (
+                        f"⚠️ @{message.from_user.username}, ваше измененное сообщение удалено из-за негативного контента.\n"
+                        f"У вас {warnings_count} предупреждений из {MAX_WARNINGS}.\n\n"
+                        f"Анализ удаленного сообщения:\n"
+                        f"- Токсичность: {toxicity_score:.2f}\n"
+                        f"- Эмоция: {emotion}"
+                    )
+                    
+                    try:
                         await context.bot.send_message(
-                            chat_id=user_id,
-                            text=f"⚠️ Предупреждение! Ваше измененное сообщение было удалено, так как содержит негативный контент.\n"
-                                 f"У вас {warnings_count} предупреждений из {MAX_WARNINGS}."
+                            chat_id=DISCUSSION_GROUP_ID,
+                            text=warning_text
                         )
                     except Exception as e:
-                        print(f"Ошибка при обработке негативного изменения: {e}")
-                        traceback.print_exc()
-                
+                        print(f"Ошибка при отправке предупреждения в группу: {e}")
+                    
+                    # Уведомляем администраторов
+                    if ADMIN_CHAT_ID:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=ADMIN_CHAT_ID,
+                                text=f"🚨 Негативное измененное сообщение от @{message.from_user.username}:\n\n"
+                                     f"Новый текст: {text}\n\n"
+                                     f"Анализ:\n"
+                                     f"- Негативность: {is_negative}\n"
+                                     f"- Токсичность: {toxicity_score:.2f}\n"
+                                     f"- Эмоция: {emotion}\n"
+                                     f"- Предупреждений: {warnings_count}/{MAX_WARNINGS}\n"
+                                     f"Сообщение было автоматически удалено."
+                            )
+                        except Exception as e:
+                            print(f"Ошибка при отправке уведомления администраторам: {e}")
+                except Exception as e:
+                    print(f"Ошибка при обработке негативного изменения: {e}")
+                    traceback.print_exc()
+            
         except Exception as e:
             print(f"Ошибка в handle_edited_message: {e}")
             traceback.print_exc()
@@ -633,15 +677,16 @@ def main():
         block=False
     ))
     
-    # Обработчик комментариев в группе обсуждений
+    # Обработчики для группы обсуждений
     if DISCUSSION_GROUP_ID:
+        # Обработчик новых сообщений
         application.add_handler(MessageHandler(
             filters.Chat(chat_id=int(DISCUSSION_GROUP_ID)) & filters.TEXT,
             bot.handle_comment,
             block=False
         ))
         
-        # Обработчик редактирования комментариев
+        # Обработчик редактирования сообщений
         application.add_handler(MessageHandler(
             filters.Chat(chat_id=int(DISCUSSION_GROUP_ID)) & filters.UpdateType.EDITED_MESSAGE,
             bot.handle_edited_message,
