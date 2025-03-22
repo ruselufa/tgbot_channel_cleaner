@@ -1,13 +1,19 @@
 import logging
 from datetime import datetime, timedelta
 import asyncio
+import sys
+import nest_asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, Defaults
+import traceback
 
 from src.models import Session, User, Comment
 from src.db.init_db import init_db
-from src.services import UserService, CommentService, ModeratorLogService
+from src.services.user_service import UserService
+from src.services.comment_service import CommentService
+from src.services.message_service import MessageService
+from src.services.moderator_log_service import ModeratorLogService
 from src.core.text_analyzer import TextAnalyzer
 from src.core.message_tracker import MessageTracker
 from src.core.message_broker import MessageBroker
@@ -29,116 +35,96 @@ class HighLoadBot:
         self.text_analyzer = TextAnalyzer()
         self.message_broker = MessageBroker()
         self.message_tracker = MessageTracker(self.text_analyzer, self.message_broker)
+        self.session = Session()
+        self.user_service = UserService(self.session)
+        self.comment_service = CommentService(self.session)
+        self.message_service = MessageService()
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Привет! Я бот-модератор. Я буду следить за комментариями в канале и помогать с модерацией."
         )
 
-    async def handle_comment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message.reply_to_message:
-            return
-            
-        session = Session()
+    async def handle_comment(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка комментария"""
         try:
-            # Инициализация сервисов
-            user_service = UserService(session)
-            comment_service = CommentService(session)
-            log_service = ModeratorLogService(session)
-            
-            # Получаем или создаем пользователя
-            user = user_service.get_or_create_user(
-                update.message.from_user.id,
-                update.message.from_user.username
-            )
-            
-            # Проверяем ограничения пользователя
-            can_comment, restriction_reason = user_service.check_user_restrictions(user)
-            if not can_comment:
-                await update.message.reply_text(restriction_reason)
+            # Проверяем, откуда пришло сообщение
+            message = update.message or update.edited_message or update.channel_post
+            if not message or not message.text:
                 return
                 
-            # Анализируем текст комментария
-            is_negative, sentiment_score, analysis = await self.text_analyzer.is_negative(update.message.text)
+            # Проверяем, что сообщение из нужного канала
+            if message.chat.id != int(CHANNEL_ID):
+                logging.info(f"Сообщение не из целевого канала. ID чата: {message.chat.id}")
+                return
+                
+            user_id = message.from_user.id if message.from_user else None
+            if not user_id:
+                logging.warning("Не удалось получить ID пользователя")
+                return
+                
+            text = message.text
             
-            # Создаем комментарий в базе
-            comment = comment_service.create_comment(
-                user=user,
-                post_id=update.message.reply_to_message.message_id,
-                text=update.message.text,
-                sentiment_score=sentiment_score
-            )
+            # Анализ текста
+            is_negative = await self.text_analyzer.is_negative(text)
+            toxicity_score = await self.text_analyzer.get_toxicity_score(text)
+            emotion = await self.text_analyzer.get_emotion(text)
             
-            # Если комментарий негативный, автоматически отклоняем его
+            logging.info(f"Text analysis results: negative={is_negative}, toxic={toxicity_score}, emotion={emotion}")
+            
+            # Проверка на негативный контент
             if is_negative:
-                reason = self.text_analyzer.get_toxicity_reason(analysis)
-                comment_service.reject_comment(comment, None, reason)
-                
-                # Добавляем предупреждение пользователю
-                warnings_count, should_ban = user_service.add_warning(user, reason)
-                
-                # Логируем действие
-                log_service.log_action(
-                    moderator_id=None,
-                    action='auto_reject_comment',
-                    target_user_id=user.telegram_id,
-                    comment_id=comment.id,
-                    details=reason,
-                    analysis_data=analysis
-                )
-                
-                # Отправляем уведомление пользователю
-                await update.message.reply_text(
-                    MESSAGES['comment_rejected'].format(reason)
-                )
-                
-                if should_ban:
-                    await update.message.reply_text(
-                        MESSAGES['user_banned'].format(24)
-                    )
-                else:
-                    await update.message.reply_text(
-                        MESSAGES['user_warning'].format(
-                            reason, warnings_count, MAX_WARNINGS
-                        )
-                    )
-            else:
-                # Начинаем отслеживание сообщения
-                await self.message_tracker.track_message(
-                    message_id=update.message.message_id,
-                    text=update.message.text,
-                    sentiment_score=sentiment_score,
-                    user_id=user.telegram_id,
-                    username=user.username
-                )
-                
-                # Отправляем комментарий на модерацию
-                keyboard = [
-                    [
-                        InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{comment.id}"),
-                        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{comment.id}")
-                    ]
-                ]
-                markup = InlineKeyboardMarkup(keyboard)
-                
-                await context.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    text=(
-                        f"Новый комментарий от @{update.message.from_user.username}\n"
-                        f"К посту: {comment.post_id}\n"
-                        f"Текст: {comment.text}\n"
-                        f"Оценка тональности: {sentiment_score:.2f}"
-                    ),
-                    reply_markup=markup
-                )
-                
-                await update.message.reply_text(MESSAGES['comment_on_moderation'])
-                
+                try:
+                    # Получаем пользователя и добавляем предупреждение
+                    user = await self.user_service.get_or_create_user(user_id, message.from_user.username)
+                    warnings_count = await self.user_service.add_warning(user_id)
+                    
+                    if warnings_count >= MAX_WARNINGS:
+                        # Баним пользователя
+                        try:
+                            await context.bot.delete_message(
+                                chat_id=message.chat.id,
+                                message_id=message.message_id
+                            )
+                            await context.bot.send_message(
+                                chat_id=message.chat.id,
+                                text=f"Пользователь @{message.from_user.username} заблокирован за нарушение правил."
+                            )
+                        except Exception as e:
+                            logging.error(f"Ошибка при удалении сообщения или бане пользователя: {e}")
+                    else:
+                        # Отправляем предупреждение
+                        try:
+                            await context.bot.send_message(
+                                chat_id=user_id,
+                                text=f"⚠️ Предупреждение! Ваше сообщение содержит негативный контент.\nУ вас {warnings_count} предупреждений из {MAX_WARNINGS}."
+                            )
+                        except Exception as e:
+                            logging.error(f"Ошибка при отправке предупреждения пользователю: {e}")
+                    
+                    # Уведомление администраторов
+                    if ADMIN_CHAT_ID:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=ADMIN_CHAT_ID,
+                                text=f"🚨 Негативное сообщение от @{message.from_user.username}:\n\n{text}\n\n"
+                                    f"Анализ:\n"
+                                    f"- Негативность: {is_negative}\n"
+                                    f"- Токсичность: {toxicity_score:.2f}\n"
+                                    f"- Эмоция: {emotion}\n"
+                                    f"- Предупреждений: {warnings_count}/{MAX_WARNINGS}"
+                            )
+                        except Exception as e:
+                            logging.error(f"Error sending message to admin chat: {e}")
+                except Exception as e:
+                    logging.error(f"Error processing warning: {e}")
+                    traceback.print_exc()
+                        
         except Exception as e:
-            logger.error(f"Error handling comment: {e}")
-            await update.message.reply_text("Произошла ошибка при обработке комментария.")
+            logging.error(f"Error processing negative comment: {e}")
+            traceback.print_exc()
         finally:
-            session.close()
+            self.session.commit()
 
     async def handle_edited_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка измененных сообщений"""
@@ -146,20 +132,15 @@ class HighLoadBot:
         if not message.reply_to_message:
             return
             
-        session = Session()
         try:
-            user_service = UserService(session)
-            comment_service = CommentService(session)
-            log_service = ModeratorLogService(session)
-            
             # Получаем пользователя
-            user = user_service.get_or_create_user(
+            user = self.user_service.get_or_create_user(
                 message.from_user.id,
                 message.from_user.username
             )
             
             # Проверяем ограничения на редактирование
-            can_edit, restriction_reason = user_service.check_edit_restrictions(user)
+            can_edit, restriction_reason = self.user_service.check_edit_restrictions(user)
             if not can_edit:
                 await message.reply_text(restriction_reason)
                 await message.delete()
@@ -177,16 +158,16 @@ class HighLoadBot:
             if check_result['is_suspicious']:
                 try:
                     # Обновляем счетчик подозрительных изменений
-                    user_service.update_suspicious_edits_count(user)
+                    self.user_service.update_suspicious_edits_count(user)
                     
                     # Записываем изменение в базу
-                    comment = session.query(Comment).filter_by(
+                    comment = self.session.query(Comment).filter_by(
                         post_id=message.reply_to_message.message_id,
                         user_id=user.id
                     ).first()
                     
                     if comment:
-                        edit = comment_service.record_edit(
+                        edit = self.comment_service.record_edit(
                             comment=comment,
                             new_text=message.text,
                             sentiment_change=check_result['edit_info']['sentiment_change'],
@@ -211,6 +192,7 @@ class HighLoadBot:
                     )
                     
                     # Логируем инцидент
+                    log_service = ModeratorLogService(self.session)
                     log_service.log_action(
                         moderator_id=None,
                         action='suspicious_edit',
@@ -228,8 +210,6 @@ class HighLoadBot:
                     
         except Exception as e:
             logger.error(f"Error in handle_edited_message: {e}")
-        finally:
-            session.close()
 
     async def _notify_moderators_about_edit(self, message, edit_info):
         """Уведомление модераторов о подозрительном изменении"""
@@ -258,27 +238,22 @@ class HighLoadBot:
         action, comment_id = query.data.split('_')
         comment_id = int(comment_id)
         
-        session = Session()
         try:
-            # Инициализация сервисов
-            comment_service = CommentService(session)
-            user_service = UserService(session)
-            log_service = ModeratorLogService(session)
-            
             # Получаем комментарий
-            comment = session.query(Comment).filter_by(id=comment_id).first()
+            comment = self.session.query(Comment).filter_by(id=comment_id).first()
             if not comment:
                 await query.edit_message_text("Комментарий не найден")
                 return
                 
             # Получаем пользователя
-            user = session.query(User).filter_by(id=comment.user_id).first()
+            user = self.session.query(User).filter_by(id=comment.user_id).first()
             
             if action == "approve":
                 # Одобряем комментарий
-                comment_service.approve_comment(comment, query.from_user.id)
+                self.comment_service.approve_comment(comment, query.from_user.id)
                 
                 # Логируем действие
+                log_service = ModeratorLogService(self.session)
                 log_service.log_action(
                     moderator_id=query.from_user.id,
                     action='approve_comment',
@@ -325,10 +300,10 @@ class HighLoadBot:
                 reason = reasons.get(reason_type, "нарушение правил")
                 
                 # Отклоняем комментарий
-                comment_service.reject_comment(comment, query.from_user.id, reason)
+                self.comment_service.reject_comment(comment, query.from_user.id, reason)
                 
                 # Добавляем предупреждение пользователю
-                warnings_count, should_ban = user_service.add_warning(user, reason)
+                warnings_count, should_ban = self.user_service.add_warning(user, reason)
                 
                 # Логируем действие
                 log_service.log_action(
@@ -369,13 +344,10 @@ class HighLoadBot:
         except Exception as e:
             logger.error(f"Error handling moderation action: {e}")
             await query.edit_message_text(f"Произошла ошибка: {e}")
-        finally:
-            session.close()
 
     async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        session = Session()
         try:
-            log_service = ModeratorLogService(session)
+            log_service = ModeratorLogService(self.session)
             
             # Получаем статистику за последние 24 часа
             stats_24h = log_service.get_moderation_stats(
@@ -413,8 +385,6 @@ class HighLoadBot:
         except Exception as e:
             logger.error(f"Error showing stats: {e}")
             await update.message.reply_text("Произошла ошибка при получении статистики")
-        finally:
-            session.close()
 
     async def cleanup_task(self):
         """Периодическая очистка старых записей"""
@@ -428,40 +398,66 @@ class HighLoadBot:
     async def cleanup_task_wrapper(self, context):
         await self.cleanup_task()
 
-if __name__ == "__main__":
+    def __del__(self):
+        """Закрываем сессию при удалении объекта"""
+        if hasattr(self, 'session'):
+            self.session.close()
+
+def main():
+    """Основная функция запуска бота"""
     try:
-        # Инициализация базы данных
-        init_db()
+        # Применяем патч для вложенных event loops
+        nest_asyncio.apply()
         
-        # Создание бота
+        # Настройка логирования
+        logging.basicConfig(
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            level=logging.INFO
+        )
+        
+        # Инициализация бота
+        defaults = Defaults(parse_mode=ParseMode.HTML)
+        application = Application.builder().token(BOT_TOKEN).defaults(defaults).build()
         bot = HighLoadBot()
         
-        # Настраиваем аргументы для бота
-        defaults = Defaults(parse_mode=ParseMode.HTML)  # Форматирование сообщений по умолчанию
-        
-        # Построитель приложения с новыми настройками
-        builder = Application.builder()
-        builder.token(BOT_TOKEN)
-        builder.defaults(defaults)
-        
-        # Построение приложения
-        application = builder.build()
-        
-        # Добавление обработчиков
+        # Регистрация обработчиков команд
         application.add_handler(CommandHandler("start", bot.start))
         application.add_handler(CommandHandler("stats", bot.show_stats))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_comment))
-        application.add_handler(MessageHandler(filters.TEXT & filters.UpdateType.EDITED_MESSAGE, bot.handle_edited_message))
+        
+        # Регистрация обработчиков сообщений для канала и обычных чатов
+        application.add_handler(MessageHandler(
+            (filters.TEXT | filters.CAPTION | filters.UpdateType.CHANNEL_POST) & ~filters.COMMAND, 
+            bot.handle_comment
+        ))
+        
+        # Регистрация обработчика изменений сообщений
+        application.add_handler(MessageHandler(
+            filters.UpdateType.EDITED_MESSAGE | filters.UpdateType.EDITED_CHANNEL_POST,
+            bot.handle_edited_message
+        ))
+        
+        # Регистрация обработчика callback-кнопок
         application.add_handler(CallbackQueryHandler(bot.handle_moderation_action))
         
-        logger.info("Бот запускается...")
+        # Добавляем задачу очистки
+        job_queue = application.job_queue
+        job_queue.run_repeating(bot.cleanup_task_wrapper, interval=timedelta(hours=24))
+        
+        # Запуск бота
+        logging.info("Бот запускается...")
         print("Бот запущен. Нажмите Ctrl+C для остановки.")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
         
-        # Синхронный запуск бота
-        application.run_polling()
-        
-    except KeyboardInterrupt:
-        print("Бот остановлен пользователем")
     except Exception as e:
-        logger.error(f"Ошибка при запуске бота: {e}")
-        print(f"Произошла ошибка: {e}") 
+        logging.error(f"Error starting bot: {e}")
+        raise
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nБот остановлен.")
+        sys.exit(0)
+    except Exception as e:
+        logging.error(f"Critical error: {e}")
+        sys.exit(1) 

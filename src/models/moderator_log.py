@@ -1,5 +1,6 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, Text, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
+
 from .base import Base
 
 class ModeratorLog(Base):
@@ -7,9 +8,9 @@ class ModeratorLog(Base):
     
     id = Column(Integer, primary_key=True)
     moderator_id = Column(Integer)
-    action = Column(String(50))
+    action = Column(String(50), nullable=False)
     target_user_id = Column(Integer)
-    comment_id = Column(Integer, nullable=True)
-    details = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    analysis_data = Column(JSON, nullable=True) 
+    comment_id = Column(Integer, ForeignKey('comments.id'))
+    details = Column(Text)
+    analysis_data = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow) 

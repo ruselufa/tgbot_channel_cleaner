@@ -17,7 +17,7 @@ REDIS_PASSWORD = os.getenv('REDIS_PASSWORD')
 
 # Moderation Settings
 MAX_WARNINGS = int(os.getenv('MAX_WARNINGS', '3'))
-BAN_DURATION = int(os.getenv('BAN_DURATION', '86400'))  # 24 hours in seconds
+BAN_DURATION_HOURS = int(os.getenv('BAN_DURATION_HOURS', '24'))  # Длительность бана в часах
 NEGATIVE_THRESHOLD = float(os.getenv('NEGATIVE_THRESHOLD', '-0.3'))
 MESSAGE_TRACKING_DAYS = int(os.getenv('MESSAGE_TRACKING_DAYS', '7'))
 
