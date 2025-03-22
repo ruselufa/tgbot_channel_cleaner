@@ -1,6 +1,6 @@
 from datetime import datetime
 from sqlalchemy.orm import Session
-from models import Comment, MessageEdit, User
+from src.models import Comment, MessageEdit, User
 
 class CommentService:
     def __init__(self, session: Session):

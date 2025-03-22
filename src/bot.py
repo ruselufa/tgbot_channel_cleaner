@@ -2,13 +2,15 @@ import logging
 from datetime import datetime, timedelta
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, Defaults
 
-from models import Session, init_db
-from services import UserService, CommentService, ModeratorLogService
-from core.text_analyzer import TextAnalyzer
-from core.message_tracker import MessageTracker
-from core.message_broker import MessageBroker
+from src.models import Session, User, Comment
+from src.db.init_db import init_db
+from src.services import UserService, CommentService, ModeratorLogService
+from src.core.text_analyzer import TextAnalyzer
+from src.core.message_tracker import MessageTracker
+from src.core.message_broker import MessageBroker
 from config.settings import (
     BOT_TOKEN, ADMIN_CHAT_ID, MESSAGES, CHANNEL_ID,
     MAX_WARNINGS, WORKER_COUNT
@@ -246,6 +248,129 @@ class HighLoadBot:
             'text': notification,
             'priority': True
         })
+        
+    async def handle_moderation_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка действий модерации (кнопки одобрения/отклонения)"""
+        query = update.callback_query
+        await query.answer()
+        
+        # Получаем данные из callback_data
+        action, comment_id = query.data.split('_')
+        comment_id = int(comment_id)
+        
+        session = Session()
+        try:
+            # Инициализация сервисов
+            comment_service = CommentService(session)
+            user_service = UserService(session)
+            log_service = ModeratorLogService(session)
+            
+            # Получаем комментарий
+            comment = session.query(Comment).filter_by(id=comment_id).first()
+            if not comment:
+                await query.edit_message_text("Комментарий не найден")
+                return
+                
+            # Получаем пользователя
+            user = session.query(User).filter_by(id=comment.user_id).first()
+            
+            if action == "approve":
+                # Одобряем комментарий
+                comment_service.approve_comment(comment, query.from_user.id)
+                
+                # Логируем действие
+                log_service.log_action(
+                    moderator_id=query.from_user.id,
+                    action='approve_comment',
+                    target_user_id=user.telegram_id,
+                    comment_id=comment.id
+                )
+                
+                # Уведомляем пользователя
+                await context.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=MESSAGES['comment_approved']
+                )
+                
+                # Обновляем сообщение модератора
+                await query.edit_message_text(
+                    f"✅ Комментарий одобрен\n"
+                    f"Пользователь: @{user.username}\n"
+                    f"Текст: {comment.text}"
+                )
+                
+            elif action == "reject":
+                # Запрашиваем причину отклонения
+                await query.edit_message_text(
+                    f"Укажите причину отклонения комментария:\n"
+                    f"Пользователь: @{user.username}\n"
+                    f"Текст: {comment.text}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Оскорбление", callback_data=f"reason_insult_{comment_id}")],
+                        [InlineKeyboardButton("Спам", callback_data=f"reason_spam_{comment_id}")],
+                        [InlineKeyboardButton("Нецензурная лексика", callback_data=f"reason_profanity_{comment_id}")],
+                        [InlineKeyboardButton("Другое", callback_data=f"reason_other_{comment_id}")]
+                    ])
+                )
+                
+            elif action.startswith("reason_"):
+                # Получаем причину отклонения
+                reason_type = action.split('_')[1]
+                reasons = {
+                    "insult": "оскорбление",
+                    "spam": "спам",
+                    "profanity": "нецензурная лексика",
+                    "other": "нарушение правил сообщества"
+                }
+                reason = reasons.get(reason_type, "нарушение правил")
+                
+                # Отклоняем комментарий
+                comment_service.reject_comment(comment, query.from_user.id, reason)
+                
+                # Добавляем предупреждение пользователю
+                warnings_count, should_ban = user_service.add_warning(user, reason)
+                
+                # Логируем действие
+                log_service.log_action(
+                    moderator_id=query.from_user.id,
+                    action='reject_comment',
+                    target_user_id=user.telegram_id,
+                    comment_id=comment.id,
+                    details=reason
+                )
+                
+                # Уведомляем пользователя
+                await context.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=MESSAGES['comment_rejected'].format(reason)
+                )
+                
+                if should_ban:
+                    await context.bot.send_message(
+                        chat_id=user.telegram_id,
+                        text=MESSAGES['user_banned'].format(24)
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=user.telegram_id,
+                        text=MESSAGES['user_warning'].format(
+                            reason, warnings_count, MAX_WARNINGS
+                        )
+                    )
+                
+                # Обновляем сообщение модератора
+                await query.edit_message_text(
+                    f"❌ Комментарий отклонен\n"
+                    f"Пользователь: @{user.username}\n"
+                    f"Причина: {reason}\n"
+                    f"Предупреждений: {warnings_count}/{MAX_WARNINGS}"
+                )
+            
+        except Exception as e:
+            logger.error(f"Error handling moderation action: {e}")
+            await query.edit_message_text(f"Произошла ошибка: {e}")
+        finally:
+            session.close()
 
     async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = Session()
@@ -293,34 +418,50 @@ class HighLoadBot:
 
     async def cleanup_task(self):
         """Периодическая очистка старых записей"""
-        while True:
-            try:
-                await self.message_tracker.cleanup_old_records()
-                await asyncio.sleep(3600)  # Раз в час
-            except Exception as e:
-                logger.error(f"Error in cleanup task: {e}")
-                await asyncio.sleep(300)  # При ошибке ждем 5 минут
-
-async def main():
-    # Инициализация базы данных
-    init_db()
-    
-    # Создание бота
-    bot = HighLoadBot()
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Добавление обработчиков
-    application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CommandHandler("stats", bot.show_stats))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_comment))
-    application.add_handler(MessageHandler(filters.TEXT & filters.UpdateType.EDITED_MESSAGE, bot.handle_edited_message))
-    application.add_handler(CallbackQueryHandler(bot.handle_moderation_action))
-    
-    # Запуск фоновых задач
-    asyncio.create_task(bot.cleanup_task())
-    
-    # Запуск бота
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+        try:
+            await self.message_tracker.cleanup_old_records()
+            logger.info("Cleanup task completed successfully")
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {e}")
+            
+    # Функция-обертка для job_queue
+    async def cleanup_task_wrapper(self, context):
+        await self.cleanup_task()
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    try:
+        # Инициализация базы данных
+        init_db()
+        
+        # Создание бота
+        bot = HighLoadBot()
+        
+        # Настраиваем аргументы для бота
+        defaults = Defaults(parse_mode=ParseMode.HTML)  # Форматирование сообщений по умолчанию
+        
+        # Построитель приложения с новыми настройками
+        builder = Application.builder()
+        builder.token(BOT_TOKEN)
+        builder.defaults(defaults)
+        
+        # Построение приложения
+        application = builder.build()
+        
+        # Добавление обработчиков
+        application.add_handler(CommandHandler("start", bot.start))
+        application.add_handler(CommandHandler("stats", bot.show_stats))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_comment))
+        application.add_handler(MessageHandler(filters.TEXT & filters.UpdateType.EDITED_MESSAGE, bot.handle_edited_message))
+        application.add_handler(CallbackQueryHandler(bot.handle_moderation_action))
+        
+        logger.info("Бот запускается...")
+        print("Бот запущен. Нажмите Ctrl+C для остановки.")
+        
+        # Синхронный запуск бота
+        application.run_polling()
+        
+    except KeyboardInterrupt:
+        print("Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"Ошибка при запуске бота: {e}")
+        print(f"Произошла ошибка: {e}") 

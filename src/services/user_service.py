@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
-from models import User, Warning
+from src.models import User, Warning
 from config import MAX_WARNINGS, BAN_DURATION
 
 class UserService:

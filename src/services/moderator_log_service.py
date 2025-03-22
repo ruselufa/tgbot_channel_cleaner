@@ -1,6 +1,6 @@
 from datetime import datetime
 from sqlalchemy.orm import Session
-from models import ModeratorLog, User, Comment
+from src.models import ModeratorLog, User, Comment
 
 class ModeratorLogService:
     def __init__(self, session: Session):
