@@ -19,6 +19,83 @@ print_warning() {
     echo -e "${YELLOW}[!] $1${NC}"
 }
 
+# Проверка наличия PostgreSQL
+check_postgres() {
+    print_message "Проверка PostgreSQL..."
+    
+    if ! command -v psql >/dev/null 2>&1; then
+        print_error "PostgreSQL не установлен"
+        
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            print_message "Установка PostgreSQL для macOS..."
+            if command -v brew >/dev/null 2>&1; then
+                brew install postgresql@14
+                brew services start postgresql@14
+            else
+                print_error "Homebrew не установлен. Установите PostgreSQL вручную"
+                exit 1
+            fi
+        elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+            print_message "Установка PostgreSQL для Linux..."
+            if command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update
+                sudo apt-get install -y postgresql postgresql-contrib
+                sudo systemctl start postgresql
+            elif command -v dnf >/dev/null 2>&1; then
+                sudo dnf install -y postgresql-server postgresql-contrib
+                sudo postgresql-setup --initdb
+                sudo systemctl start postgresql
+            else
+                print_error "Неподдерживаемый дистрибутив Linux. Установите PostgreSQL вручную"
+                exit 1
+            fi
+        else
+            print_error "Неподдерживаемая операционная система"
+            exit 1
+        fi
+    else
+        print_message "PostgreSQL уже установлен"
+    fi
+}
+
+# Проверка наличия Redis
+check_redis() {
+    print_message "Проверка Redis..."
+    
+    if ! command -v redis-cli >/dev/null 2>&1; then
+        print_error "Redis не установлен"
+        
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            print_message "Установка Redis для macOS..."
+            if command -v brew >/dev/null 2>&1; then
+                brew install redis
+                brew services start redis
+            else
+                print_error "Homebrew не установлен. Установите Redis вручную"
+                exit 1
+            fi
+        elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+            print_message "Установка Redis для Linux..."
+            if command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update
+                sudo apt-get install -y redis-server
+                sudo systemctl start redis-server
+            elif command -v dnf >/dev/null 2>&1; then
+                sudo dnf install -y redis
+                sudo systemctl start redis
+            else
+                print_error "Неподдерживаемый дистрибутив Linux. Установите Redis вручную"
+                exit 1
+            fi
+        else
+            print_error "Неподдерживаемая операционная система"
+            exit 1
+        fi
+    else
+        print_message "Redis уже установлен"
+    fi
+}
+
 # Проверка наличия Python 3.10 или выше
 check_python() {
     if command -v python3 >/dev/null 2>&1; then
@@ -84,6 +161,43 @@ install_dependencies() {
     fi
 }
 
+# Создание и инициализация базы данных
+setup_database() {
+    print_message "Настройка базы данных..."
+    
+    # Загружаем переменные окружения
+    if [ -f ".env" ]; then
+        source .env
+    else
+        print_error "Файл .env не найден"
+        return 1
+    fi
+    
+    # Извлекаем параметры подключения из DATABASE_URL
+    if [[ $DATABASE_URL =~ postgresql://([^:]+):([^@]+)@([^:]+):([^/]+)/(.+) ]]; then
+        DB_USER="${BASH_REMATCH[1]}"
+        DB_PASS="${BASH_REMATCH[2]}"
+        DB_HOST="${BASH_REMATCH[3]}"
+        DB_PORT="${BASH_REMATCH[4]}"
+        DB_NAME="${BASH_REMATCH[5]}"
+    else
+        print_error "Неверный формат DATABASE_URL"
+        return 1
+    fi
+    
+    # Проверяем, существует ли база данных
+    if ! psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
+        print_message "Создание базы данных..."
+        createdb -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" "$DB_NAME"
+    else
+        print_message "База данных уже существует"
+    fi
+    
+    # Инициализация базы данных
+    print_message "Инициализация базы данных..."
+    PYTHONPATH=$(pwd) python src/db/init_db.py
+}
+
 # Проверка наличия .env файла
 check_env() {
     print_message "Проверка конфигурации..."
@@ -130,9 +244,12 @@ main() {
     print_message "Начало установки..."
     
     check_python
+    check_postgres
+    check_redis
     setup_venv
     install_dependencies
     check_env
+    setup_database
     
     print_message "Установка завершена успешно!"
     print_message "Для запуска бота активируйте виртуальное окружение:"
