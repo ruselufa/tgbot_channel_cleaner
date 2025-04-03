@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 import logging
 from sqlalchemy.orm import Session
 from src.models import User, Warning
-from config.settings import MAX_WARNINGS, BAN_DURATION_HOURS
+from config.settings import MAX_WARNINGS, BAN_DURATION
 
 class UserService:
     def __init__(self, session: Session):
@@ -154,7 +154,7 @@ class UserService:
             # Если достигнут лимит предупреждений, баним пользователя
             if user.warning_count >= MAX_WARNINGS:
                 user.is_banned = True
-                user.banned_until = datetime.utcnow() + timedelta(hours=BAN_DURATION_HOURS)
+                user.banned_until = datetime.utcnow() + timedelta(hours=BAN_DURATION)
                 
             self.session.commit()
             return user.warning_count
